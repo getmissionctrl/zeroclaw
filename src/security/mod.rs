@@ -25,17 +25,17 @@ pub mod detect;
 pub mod docker;
 
 // Prompt injection defense (contributed from RustyClaw, MIT licensed)
-pub mod leak_detector;
-pub mod prompt_guard;
 pub mod domain_matcher;
 pub mod estop;
 #[cfg(target_os = "linux")]
 pub mod firejail;
 #[cfg(feature = "sandbox-landlock")]
 pub mod landlock;
+pub mod leak_detector;
 pub mod otp;
 pub mod pairing;
 pub mod policy;
+pub mod prompt_guard;
 pub mod secrets;
 pub mod traits;
 

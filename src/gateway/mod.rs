@@ -12,7 +12,9 @@ pub mod sse;
 pub mod static_files;
 pub mod ws;
 
-use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel, WhatsAppChannel};
+use crate::channels::{
+    Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel, WhatsAppChannel,
+};
 use crate::config::Config;
 use crate::cost::CostTracker;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -24,7 +26,6 @@ use crate::tools;
 use crate::tools::traits::ToolSpec;
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use axum::{
     body::Bytes,
     extract::{ConnectInfo, Query, State},
@@ -34,6 +35,7 @@ use axum::{
     Router,
 };
 use parking_lot::Mutex;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -1342,10 +1344,7 @@ pub struct WatiVerifyQuery {
 }
 
 /// POST /wati — incoming WATI WhatsApp message webhook
-async fn handle_wati_webhook(
-    State(state): State<AppState>,
-    body: Bytes,
-) -> impl IntoResponse {
+async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
     let Some(ref wati) = state.wati else {
         return (
             StatusCode::NOT_FOUND,

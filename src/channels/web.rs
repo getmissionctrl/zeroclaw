@@ -476,13 +476,10 @@ mod tests {
         .unwrap();
 
         // Receive on channel_rx
-        let received = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            channel_rx.recv(),
-        )
-        .await
-        .expect("timeout waiting for channel message")
-        .expect("channel_rx closed");
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), channel_rx.recv())
+            .await
+            .expect("timeout waiting for channel message")
+            .expect("channel_rx closed");
 
         assert_eq!(received.channel, "web");
         assert_eq!(received.content, "hello from test");
