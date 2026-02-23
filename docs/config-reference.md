@@ -478,6 +478,7 @@ Examples:
 - `[channels_config.nextcloud_talk]`
 - `[channels_config.email]`
 - `[channels_config.nostr]`
+- `[channels_config.web]`
 
 Notes:
 
@@ -505,6 +506,33 @@ Notes:
 - The `private_key` is a high-value secret; keep `secrets.encrypt = true` (the default) in production.
 
 See detailed channel matrix and allowlist behavior in [channels-reference.md](channels-reference.md).
+
+### `[channels_config.web]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `port` | `5100` | Port to listen on for WebSocket connections |
+| `bind` | `"127.0.0.1"` | Bind address for the WebSocket server |
+| `stream_mode` | `"partial"` | Streaming mode: `"off"` or `"partial"` |
+| `draft_update_interval_ms` | `300` | Flush interval (ms) for streaming draft updates |
+| `allowed_origins` | `[]` | Allowed origin hosts for CORS; empty = allow all |
+
+Example:
+
+```toml
+[channels_config.web]
+port = 5100
+bind = "127.0.0.1"
+stream_mode = "partial"
+draft_update_interval_ms = 300
+```
+
+Notes:
+
+- The web channel runs a dedicated WebSocket server on its own port, separate from the gateway (port 3000).
+- Each connected browser client gets a unique sender identity and conversation history, like Telegram or Discord users.
+- When `stream_mode = "partial"`, partial responses are streamed to the browser as they are generated.
+- The web UI's Node.js server can proxy browser WebSocket connections to this channel.
 
 ### `[channels_config.whatsapp]`
 

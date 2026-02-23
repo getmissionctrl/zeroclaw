@@ -120,6 +120,7 @@ If `[channels_config.matrix]`, `[channels_config.lark]`, or `[channels_config.fe
 | Linq | webhook (`/linq`) | Yes (public HTTPS callback) |
 | iMessage | local integration | No |
 | Nostr | relay websocket (NIP-04 / NIP-17) | No |
+| Web | WebSocket (dedicated port) | No |
 
 ---
 
@@ -426,6 +427,23 @@ Notes:
 [channels_config.imessage]
 allowed_contacts = ["*"]
 ```
+
+### 4.18 Web
+
+```toml
+[channels_config.web]
+port = 5100
+bind = "127.0.0.1"
+stream_mode = "partial"
+draft_update_interval_ms = 300
+```
+
+Notes:
+
+- Runs a dedicated WebSocket server on its own port (default 5100), separate from the gateway.
+- Each browser client gets a unique sender identity and full access to the agent loop.
+- Supports streaming via draft updates when `stream_mode = "partial"`.
+- The web UI's Node.js server proxies browser connections to this channel.
 
 ---
 
