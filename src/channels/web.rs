@@ -430,4 +430,65 @@ mod tests {
         assert_eq!(req.text, "");
         assert!(req.images.is_empty());
     }
+
+    #[tokio::test]
+    async fn ws_round_trip_sends_channel_message() {
+        use tokio_tungstenite::connect_async;
+
+        let (channel_tx, mut channel_rx) = mpsc::channel::<ChannelMessage>(16);
+        let ch = WebChannel::new(0, "127.0.0.1".into(), StreamMode::Partial, 300);
+
+        // Use port 0 for test (OS picks a free port)
+        let state = AppState {
+            channel_tx,
+            clients: Arc::clone(&ch.clients),
+            stream_mode: ch.stream_mode,
+            draft_update_interval_ms: ch.draft_update_interval_ms,
+        };
+
+        let app = Router::new()
+            .route("/ws", get(ws_upgrade_handler))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Start server in background
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        // Connect WS client
+        let url = format!("ws://{addr}/ws");
+        let (mut ws, _) = connect_async(&url).await.expect("WS connect failed");
+
+        // Send a chat message
+        let msg = serde_json::json!({"type":"chat","text":"hello from test","images":[]});
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            msg.to_string().into(),
+        ))
+        .await
+        .unwrap();
+
+        // Receive on channel_rx
+        let received = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            channel_rx.recv(),
+        )
+        .await
+        .expect("timeout waiting for channel message")
+        .expect("channel_rx closed");
+
+        assert_eq!(received.channel, "web");
+        assert_eq!(received.content, "hello from test");
+        assert!(received.sender.starts_with("web_"));
+
+        // Cleanup
+        ws.close(None).await.ok();
+    }
 }
