@@ -1,6 +1,6 @@
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ToolCall as ProviderToolCall,
+    Provider, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -73,6 +73,10 @@ struct NativeMessage {
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<NativeToolCall>>,
+    /// Raw reasoning content from thinking models; pass-through for providers
+    /// that require it in assistant tool-call history messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -121,6 +125,16 @@ struct NativeFunctionCall {
 #[derive(Debug, Deserialize)]
 struct NativeChatResponse {
     choices: Vec<NativeChoice>,
+    #[serde(default)]
+    usage: Option<UsageInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageInfo {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -207,11 +221,16 @@ impl OpenAiProvider {
                                     .get("content")
                                     .and_then(serde_json::Value::as_str)
                                     .map(ToString::to_string);
+                                let reasoning_content = value
+                                    .get("reasoning_content")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToString::to_string);
                                 return NativeMessage {
                                     role: "assistant".to_string(),
                                     content,
                                     tool_call_id: None,
                                     tool_calls: Some(tool_calls),
+                                    reasoning_content,
                                 };
                             }
                         }
@@ -233,6 +252,7 @@ impl OpenAiProvider {
                             content,
                             tool_call_id,
                             tool_calls: None,
+                            reasoning_content: None,
                         };
                     }
                 }
@@ -242,6 +262,7 @@ impl OpenAiProvider {
                     content: Some(m.content.clone()),
                     tool_call_id: None,
                     tool_calls: None,
+                    reasoning_content: None,
                 }
             })
             .collect()
@@ -249,6 +270,7 @@ impl OpenAiProvider {
 
     fn parse_native_response(message: NativeResponseMessage) -> ProviderChatResponse {
         let text = message.effective_content();
+        let reasoning_content = message.reasoning_content.clone();
         let tool_calls = message
             .tool_calls
             .unwrap_or_default()
@@ -260,7 +282,12 @@ impl OpenAiProvider {
             })
             .collect::<Vec<_>>();
 
-        ProviderChatResponse { text, tool_calls }
+        ProviderChatResponse {
+            text,
+            tool_calls,
+            usage: None,
+            reasoning_content,
+        }
     }
 
     fn http_client(&self) -> Client {
@@ -355,13 +382,19 @@ impl Provider for OpenAiProvider {
         }
 
         let native_response: NativeChatResponse = response.json().await?;
+        let usage = native_response.usage.map(|u| TokenUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+        });
         let message = native_response
             .choices
             .into_iter()
             .next()
             .map(|c| c.message)
             .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))?;
-        Ok(Self::parse_native_response(message))
+        let mut result = Self::parse_native_response(message);
+        result.usage = usage;
+        Ok(result)
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -412,13 +445,19 @@ impl Provider for OpenAiProvider {
         }
 
         let native_response: NativeChatResponse = response.json().await?;
+        let usage = native_response.usage.map(|u| TokenUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+        });
         let message = native_response
             .choices
             .into_iter()
             .next()
             .map(|c| c.message)
             .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))?;
-        Ok(Self::parse_native_response(message))
+        let mut result = Self::parse_native_response(message);
+        result.usage = usage;
+        Ok(result)
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -673,5 +712,120 @@ mod tests {
         let spec = parse_native_tool_spec(json).unwrap();
         assert_eq!(spec.kind, "function");
         assert_eq!(spec.function.name, "shell");
+    }
+
+    #[test]
+    fn native_response_parses_usage() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50}
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, Some(100));
+        assert_eq!(usage.completion_tokens, Some(50));
+    }
+
+    #[test]
+    fn native_response_parses_without_usage() {
+        let json = r#"{"choices": [{"message": {"content": "Hello"}}]}"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.usage.is_none());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // reasoning_content pass-through tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_native_response_captures_reasoning_content() {
+        let json = r#"{"choices":[{"message":{
+            "content":"answer",
+            "reasoning_content":"thinking step",
+            "tool_calls":[{"id":"call_1","type":"function","function":{"name":"shell","arguments":"{}"}}]
+        }}]}"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let message = resp.choices.into_iter().next().unwrap().message;
+        let parsed = OpenAiProvider::parse_native_response(message);
+        assert_eq!(parsed.reasoning_content.as_deref(), Some("thinking step"));
+        assert_eq!(parsed.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn parse_native_response_none_reasoning_content_for_normal_model() {
+        let json = r#"{"choices":[{"message":{"content":"hello"}}]}"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let message = resp.choices.into_iter().next().unwrap().message;
+        let parsed = OpenAiProvider::parse_native_response(message);
+        assert!(parsed.reasoning_content.is_none());
+    }
+
+    #[test]
+    fn convert_messages_round_trips_reasoning_content() {
+        use crate::providers::ChatMessage;
+
+        let history_json = serde_json::json!({
+            "content": "I will check",
+            "tool_calls": [{
+                "id": "tc_1",
+                "name": "shell",
+                "arguments": "{}"
+            }],
+            "reasoning_content": "Let me think..."
+        });
+
+        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+        let native = OpenAiProvider::convert_messages(&messages);
+        assert_eq!(native.len(), 1);
+        assert_eq!(
+            native[0].reasoning_content.as_deref(),
+            Some("Let me think...")
+        );
+    }
+
+    #[test]
+    fn convert_messages_no_reasoning_content_when_absent() {
+        use crate::providers::ChatMessage;
+
+        let history_json = serde_json::json!({
+            "content": "I will check",
+            "tool_calls": [{
+                "id": "tc_1",
+                "name": "shell",
+                "arguments": "{}"
+            }]
+        });
+
+        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+        let native = OpenAiProvider::convert_messages(&messages);
+        assert_eq!(native.len(), 1);
+        assert!(native[0].reasoning_content.is_none());
+    }
+
+    #[test]
+    fn native_message_omits_reasoning_content_when_none() {
+        let msg = NativeMessage {
+            role: "assistant".to_string(),
+            content: Some("hi".to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("reasoning_content"));
+    }
+
+    #[test]
+    fn native_message_includes_reasoning_content_when_some() {
+        let msg = NativeMessage {
+            role: "assistant".to_string(),
+            content: Some("hi".to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: Some("thinking...".to_string()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("reasoning_content"));
+        assert!(json.contains("thinking..."));
     }
 }

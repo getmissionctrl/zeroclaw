@@ -64,6 +64,8 @@ impl Provider for MockProvider {
             return Ok(ChatResponse {
                 text: Some("done".into()),
                 tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
             });
         }
         Ok(guard.remove(0))
@@ -188,6 +190,8 @@ impl Provider for RecordingProvider {
             return Ok(ChatResponse {
                 text: Some("done".into()),
                 tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
             });
         }
         Ok(guard.remove(0))
@@ -235,6 +239,8 @@ fn text_response(text: &str) -> ChatResponse {
     ChatResponse {
         text: Some(text.into()),
         tool_calls: vec![],
+        usage: None,
+        reasoning_content: None,
     }
 }
 
@@ -242,6 +248,8 @@ fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
     ChatResponse {
         text: Some(String::new()),
         tool_calls: calls,
+        usage: None,
+        reasoning_content: None,
     }
 }
 
@@ -365,6 +373,8 @@ async fn e2e_xml_dispatcher_tool_call() {
                     .into(),
             ),
             tool_calls: vec![],
+            usage: None,
+            reasoning_content: None,
         },
         text_response("XML tool executed"),
     ]));

@@ -114,8 +114,14 @@ impl HttpRequestTool {
         headers: Vec<(String, String)>,
         body: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
+        let timeout_secs = if self.timeout_secs == 0 {
+            tracing::warn!("http_request: timeout_secs is 0, using safe default of 30s");
+            30
+        } else {
+            self.timeout_secs
+        };
         let builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
+            .timeout(Duration::from_secs(timeout_secs))
             .connect_timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none());
         let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.http_request");
@@ -371,6 +377,10 @@ fn extract_host(url: &str) -> anyhow::Result<String> {
 }
 
 fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
+    if allowed_domains.iter().any(|domain| domain == "*") {
+        return true;
+    }
+
     allowed_domains.iter().any(|domain| {
         host == domain
             || host
@@ -485,6 +495,22 @@ mod tests {
     fn validate_accepts_subdomain() {
         let tool = test_tool(vec!["example.com"]);
         assert!(tool.validate_url("https://api.example.com/v1").is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_wildcard_allowlist_for_public_host() {
+        let tool = test_tool(vec!["*"]);
+        assert!(tool.validate_url("https://news.ycombinator.com").is_ok());
+    }
+
+    #[test]
+    fn validate_wildcard_allowlist_still_rejects_private_host() {
+        let tool = test_tool(vec!["*"]);
+        let err = tool
+            .validate_url("https://localhost:8080")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"));
     }
 
     #[test]

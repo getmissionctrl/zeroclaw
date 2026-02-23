@@ -49,6 +49,13 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// Raw token counts from a single LLM API response.
+#[derive(Debug, Clone, Default)]
+pub struct TokenUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+}
+
 /// An LLM response that may contain text, tool calls, or both.
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
@@ -56,6 +63,13 @@ pub struct ChatResponse {
     pub text: Option<String>,
     /// Tool calls requested by the LLM.
     pub tool_calls: Vec<ToolCall>,
+    /// Token usage reported by the provider, if available.
+    pub usage: Option<TokenUsage>,
+    /// Raw reasoning/thinking content from thinking models (e.g. DeepSeek-R1,
+    /// Kimi K2.5, GLM-4.7). Preserved as an opaque pass-through so it can be
+    /// sent back in subsequent API requests — some providers reject tool-call
+    /// history that omits this field.
+    pub reasoning_content: Option<String>,
 }
 
 impl ChatResponse {
@@ -94,6 +108,9 @@ pub enum ConversationMessage {
     AssistantToolCalls {
         text: Option<String>,
         tool_calls: Vec<ToolCall>,
+        /// Raw reasoning content from thinking models, preserved for round-trip
+        /// fidelity with provider APIs that require it.
+        reasoning_content: Option<String>,
     },
     /// Results of tool executions, fed back to the LLM.
     ToolResults(Vec<ToolResultMessage>),
@@ -344,6 +361,8 @@ pub trait Provider: Send + Sync {
                 return Ok(ChatResponse {
                     text: Some(text),
                     tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
                 });
             }
         }
@@ -354,6 +373,8 @@ pub trait Provider: Send + Sync {
         Ok(ChatResponse {
             text: Some(text),
             tool_calls: Vec::new(),
+            usage: None,
+            reasoning_content: None,
         })
     }
 
@@ -387,6 +408,8 @@ pub trait Provider: Send + Sync {
         Ok(ChatResponse {
             text: Some(text),
             tool_calls: Vec::new(),
+            usage: None,
+            reasoning_content: None,
         })
     }
 
@@ -510,6 +533,8 @@ mod tests {
         let empty = ChatResponse {
             text: None,
             tool_calls: vec![],
+            usage: None,
+            reasoning_content: None,
         };
         assert!(!empty.has_tool_calls());
         assert_eq!(empty.text_or_empty(), "");
@@ -521,9 +546,33 @@ mod tests {
                 name: "shell".into(),
                 arguments: "{}".into(),
             }],
+            usage: None,
+            reasoning_content: None,
         };
         assert!(with_tools.has_tool_calls());
         assert_eq!(with_tools.text_or_empty(), "Let me check");
+    }
+
+    #[test]
+    fn token_usage_default_is_none() {
+        let usage = TokenUsage::default();
+        assert!(usage.input_tokens.is_none());
+        assert!(usage.output_tokens.is_none());
+    }
+
+    #[test]
+    fn chat_response_with_usage() {
+        let resp = ChatResponse {
+            text: Some("Hello".into()),
+            tool_calls: vec![],
+            usage: Some(TokenUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(50),
+            }),
+            reasoning_content: None,
+        };
+        assert_eq!(resp.usage.as_ref().unwrap().input_tokens, Some(100));
+        assert_eq!(resp.usage.as_ref().unwrap().output_tokens, Some(50));
     }
 
     #[test]
