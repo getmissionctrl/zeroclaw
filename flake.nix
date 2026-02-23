@@ -38,7 +38,7 @@
           "rustfmt"
         ];
       in {
-        packages.default = fenix.packages.${system}.stable.toolchain;
+        packages.default = pkgs.callPackage ./default.nix { };
         devShells.default = pkgs.mkShell {
           packages = [
             rustToolchain
