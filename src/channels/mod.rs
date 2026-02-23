@@ -36,6 +36,7 @@ pub mod telegram;
 pub mod traits;
 pub mod transcription;
 pub mod wati;
+pub mod web;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_storage;
@@ -63,6 +64,7 @@ pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
 pub use wati::WatiChannel;
+pub use web::WebChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
