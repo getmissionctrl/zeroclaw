@@ -2462,6 +2462,8 @@ pub struct ChannelsConfig {
     /// QQ Official Bot channel configuration.
     pub qq: Option<QQConfig>,
     pub nostr: Option<NostrConfig>,
+    /// Web UI WebSocket channel configuration.
+    pub web: Option<WebConfig>,
     /// ClawdTalk voice channel configuration.
     pub clawdtalk: Option<crate::channels::clawdtalk::ClawdTalkConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
@@ -2594,6 +2596,7 @@ impl Default for ChannelsConfig {
             dingtalk: None,
             qq: None,
             nostr: None,
+            web: None,
             clawdtalk: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
         }
@@ -3419,6 +3422,42 @@ impl ChannelConfig for QQConfig {
     fn desc() -> &'static str {
         "Tencent QQ Bot"
     }
+}
+
+/// Web UI WebSocket channel configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WebConfig {
+    /// Port to listen on for WebSocket connections.
+    #[serde(default = "default_web_port")]
+    pub port: u16,
+    /// Bind address for the WebSocket server.
+    #[serde(default = "default_web_bind")]
+    pub bind: String,
+    /// Streaming mode (off or partial). Default: partial.
+    #[serde(default = "default_web_stream_mode")]
+    pub stream_mode: StreamMode,
+    /// Draft update flush interval in milliseconds.
+    #[serde(default = "default_web_draft_update_interval_ms")]
+    pub draft_update_interval_ms: u64,
+    /// Optional list of allowed origin hosts for CORS. Empty = allow all.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+}
+
+fn default_web_port() -> u16 {
+    5100
+}
+
+fn default_web_bind() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_web_stream_mode() -> StreamMode {
+    StreamMode::Partial
+}
+
+fn default_web_draft_update_interval_ms() -> u64 {
+    300
 }
 
 /// Nostr channel configuration (NIP-04 + NIP-17 private messages)
@@ -4750,6 +4789,7 @@ default_temperature = 0.7
                 dingtalk: None,
                 qq: None,
                 nostr: None,
+                web: None,
                 clawdtalk: None,
                 message_timeout_secs: 300,
             },
@@ -5305,6 +5345,7 @@ allowed_users = ["@ops:matrix.org"]
             dingtalk: None,
             qq: None,
             nostr: None,
+            web: None,
             clawdtalk: None,
             message_timeout_secs: 300,
         };
@@ -5519,6 +5560,7 @@ channel_id = "C123"
             dingtalk: None,
             qq: None,
             nostr: None,
+            web: None,
             clawdtalk: None,
             message_timeout_secs: 300,
         };
