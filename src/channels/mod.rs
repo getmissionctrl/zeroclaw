@@ -2926,6 +2926,18 @@ fn collect_configured_channels(
         });
     }
 
+    if let Some(ref web_cfg) = config.channels_config.web {
+        channels.push(ConfiguredChannel {
+            display_name: "Web",
+            channel: Arc::new(WebChannel::new(
+                web_cfg.port,
+                web_cfg.bind.clone(),
+                web_cfg.stream_mode,
+                web_cfg.draft_update_interval_ms,
+            )),
+        });
+    }
+
     if let Some(ref ct) = config.channels_config.clawdtalk {
         channels.push(ConfiguredChannel {
             display_name: "ClawdTalk",
