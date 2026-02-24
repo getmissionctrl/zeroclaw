@@ -153,6 +153,7 @@ enum ChannelRuntimeCommand {
     SetProvider(String),
     ShowModel,
     SetModel(String),
+    NewConversation,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -225,6 +226,7 @@ struct ChannelRuntimeContext {
     multimodal: crate::config::MultimodalConfig,
     hooks: Option<Arc<crate::hooks::HookRunner>>,
     non_cli_excluded_tools: Arc<Vec<String>>,
+    audit_logger: Option<Arc<crate::security::AuditLogger>>,
 }
 
 #[derive(Clone)]
@@ -420,6 +422,60 @@ fn build_channel_system_prompt(base_prompt: &str, channel_name: &str) -> String 
     }
 }
 
+/// Build a concise summary of active (in_progress / blocked) goals for injection
+/// into channel system prompts.  This lets the agent correlate user messages with
+/// ongoing goals and proactively update goal state when users provide corrections,
+/// new information, or feedback relevant to an existing goal.
+///
+/// The summary is intentionally compact (≤ ~1500 chars) to avoid crowding the
+/// context window.
+async fn build_active_goals_summary(workspace_dir: &Path) -> String {
+    let engine = crate::goals::engine::GoalEngine::new(workspace_dir);
+    let state = match engine.load_state().await {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+
+    use crate::goals::engine::GoalStatus;
+
+    let active: Vec<_> = state
+        .goals
+        .iter()
+        .filter(|g| matches!(g.status, GoalStatus::InProgress | GoalStatus::Blocked))
+        .collect();
+
+    if active.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from(
+        "== Active Goals (read from state/goals.json) ==\n\
+         IMPORTANT: First determine whether the user's message is an independent question/topic \
+         or directly related to one of these goals. Most user messages are independent questions — \
+         answer them directly without modifying any goal state.\n\
+         Only update a goal when the user's message EXPLICITLY and CLEARLY refers to that specific \
+         goal (e.g. by goal ID, exact task name, or unambiguous continuation of a prior conversation \
+         about that goal). Do NOT force-associate loosely related keywords with existing goals.\n\
+         When you do update a goal, use file_edit on state/goals.json (e.g. revise description, \
+         update working_memory, adjust steps, change status).\n\n",
+    );
+
+    for g in &active {
+        let status = match g.status {
+            GoalStatus::InProgress => "in_progress",
+            GoalStatus::Blocked => "blocked",
+            _ => unreachable!(),
+        };
+        let _ = writeln!(out, "- [{}] ({}) {}", g.id, status, g.description);
+        if let Some(ref wm) = g.working_memory {
+            let wm_preview = truncate_with_ellipsis(wm, 200);
+            let _ = writeln!(out, "  working_memory: {wm_preview}");
+        }
+    }
+
+    out
+}
+
 fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     let mut normalized = Vec::with_capacity(turns.len());
     let mut expecting_user = true;
@@ -458,10 +514,6 @@ fn supports_runtime_model_switch(channel_name: &str) -> bool {
 }
 
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
-    if !supports_runtime_model_switch(channel_name) {
-        return None;
-    }
-
     let trimmed = content.trim();
     if !trimmed.starts_with('/') {
         return None;
@@ -476,7 +528,10 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         .to_ascii_lowercase();
 
     match base_command.as_str() {
-        "/models" => {
+        // /new and /clear work on all channels.
+        "/new" | "/clear" => Some(ChannelRuntimeCommand::NewConversation),
+        // Model switching is only available on channels that support it.
+        "/models" if supports_runtime_model_switch(channel_name) => {
             if let Some(provider) = parts.next() {
                 Some(ChannelRuntimeCommand::SetProvider(
                     provider.trim().to_string(),
@@ -485,7 +540,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 Some(ChannelRuntimeCommand::ShowProviders)
             }
         }
-        "/model" => {
+        "/model" if supports_runtime_model_switch(channel_name) => {
             let model = parts.collect::<Vec<_>>().join(" ").trim().to_string();
             if model.is_empty() {
                 Some(ChannelRuntimeCommand::ShowModel)
@@ -984,6 +1039,10 @@ async fn handle_runtime_command_if_needed(
     let mut current = get_route_selection(ctx, &sender_key);
 
     let response = match command {
+        ChannelRuntimeCommand::NewConversation => {
+            clear_sender_history(ctx, &sender_key);
+            "🔄 Conversation context cleared. Starting fresh.".to_string()
+        }
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
         ChannelRuntimeCommand::SetProvider(raw_provider) => {
             match resolve_provider_alias(&raw_provider) {
@@ -1485,6 +1544,9 @@ async fn process_channel_message(
         return;
     }
 
+    let health_component = format!("channel:{}", msg.channel);
+    crate::health::set_component_activity(&health_component, Some("processing"));
+
     println!(
         "  💬 [{}] from {}: {}",
         msg.channel,
@@ -1598,7 +1660,16 @@ async fn process_channel_message(
         }
     }
 
-    let system_prompt = build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel);
+    let mut system_prompt = build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel);
+
+    // Inject active goals summary so the agent can correlate user messages
+    // with in-progress goals and update them proactively.
+    let goals_summary = build_active_goals_summary(&ctx.workspace_dir).await;
+    if !goals_summary.is_empty() {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(&goals_summary);
+    }
+
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
     let use_streaming = target_channel
@@ -1620,7 +1691,7 @@ async fn process_channel_message(
         (None, None)
     };
 
-    let draft_message_id = if use_streaming {
+    let draft_message_id: Option<Arc<tokio::sync::Mutex<String>>> = if use_streaming {
         if let Some(channel) = target_channel.as_ref() {
             match channel
                 .send_draft(
@@ -1628,7 +1699,8 @@ async fn process_channel_message(
                 )
                 .await
             {
-                Ok(id) => id,
+                Ok(Some(id)) => Some(Arc::new(tokio::sync::Mutex::new(id))),
+                Ok(None) => None,
                 Err(e) => {
                     tracing::debug!("Failed to send draft on {}: {e}", channel.name());
                     None
@@ -1641,14 +1713,11 @@ async fn process_channel_message(
         None
     };
 
-    let draft_updater = if let (Some(mut rx), Some(draft_id_ref), Some(channel_ref)) = (
-        delta_rx,
-        draft_message_id.as_deref(),
-        target_channel.as_ref(),
-    ) {
+    let draft_updater = if let (Some(mut rx), Some(draft_id_arc), Some(channel_ref)) =
+        (delta_rx, draft_message_id.clone(), target_channel.as_ref())
+    {
         let channel = Arc::clone(channel_ref);
         let reply_target = msg.reply_target.clone();
-        let draft_id = draft_id_ref.to_string();
         Some(tokio::spawn(async move {
             let mut accumulated = String::new();
             while let Some(delta) = rx.recv().await {
@@ -1657,11 +1726,18 @@ async fn process_channel_message(
                     continue;
                 }
                 accumulated.push_str(&delta);
-                if let Err(e) = channel
+                let draft_id = draft_id_arc.lock().await.clone();
+                match channel
                     .update_draft(&reply_target, &draft_id, &accumulated)
                     .await
                 {
-                    tracing::debug!("Draft update failed: {e}");
+                    Ok(Some(new_id)) => {
+                        *draft_id_arc.lock().await = new_id;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::debug!("Draft update failed: {e}");
+                    }
                 }
             }
         }))
@@ -1724,6 +1800,8 @@ async fn process_channel_message(
                 } else {
                     ctx.non_cli_excluded_tools.as_ref()
                 },
+                Some(ctx.workspace_dir.as_path()),
+                ctx.audit_logger.as_deref(),
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -1764,11 +1842,12 @@ async fn process_channel_message(
                     "elapsed_ms": started_at.elapsed().as_millis(),
                 }),
             );
-            if let (Some(channel), Some(draft_id)) =
-                (target_channel.as_ref(), draft_message_id.as_deref())
-            {
-                if let Err(err) = channel.cancel_draft(&msg.reply_target, draft_id).await {
-                    tracing::debug!("Failed to cancel draft on {}: {err}", channel.name());
+            if let Some(channel) = target_channel.as_ref() {
+                if let Some(ref draft_id_arc) = draft_message_id {
+                    let draft_id = draft_id_arc.lock().await.clone();
+                    if let Err(err) = channel.cancel_draft(&msg.reply_target, &draft_id).await {
+                        tracing::debug!("Failed to cancel draft on {}: {err}", channel.name());
+                    }
                 }
             }
         }
@@ -1876,9 +1955,18 @@ async fn process_channel_message(
                 truncate_with_ellipsis(&delivered_response, 80)
             );
             if let Some(channel) = target_channel.as_ref() {
-                if let Some(ref draft_id) = draft_message_id {
-                    if let Err(e) = channel
-                        .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
+                if let Some(ref draft_id_arc) = draft_message_id {
+                    let draft_id = draft_id_arc.lock().await.clone();
+                    if delivered_response.trim().is_empty() {
+                        // Nothing to show — remove the placeholder draft
+                        if let Err(err) = channel.cancel_draft(&msg.reply_target, &draft_id).await {
+                            tracing::debug!(
+                                "Failed to cancel empty draft on {}: {err}",
+                                channel.name()
+                            );
+                        }
+                    } else if let Err(e) = channel
+                        .finalize_draft(&msg.reply_target, &draft_id, &delivered_response)
                         .await
                     {
                         tracing::warn!("Failed to finalize draft: {e}; sending as new message");
@@ -1921,11 +2009,12 @@ async fn process_channel_message(
                         "elapsed_ms": started_at.elapsed().as_millis(),
                     }),
                 );
-                if let (Some(channel), Some(draft_id)) =
-                    (target_channel.as_ref(), draft_message_id.as_deref())
-                {
-                    if let Err(err) = channel.cancel_draft(&msg.reply_target, draft_id).await {
-                        tracing::debug!("Failed to cancel draft on {}: {err}", channel.name());
+                if let Some(channel) = target_channel.as_ref() {
+                    if let Some(ref draft_id_arc) = draft_message_id {
+                        let draft_id = draft_id_arc.lock().await.clone();
+                        if let Err(err) = channel.cancel_draft(&msg.reply_target, &draft_id).await {
+                            tracing::debug!("Failed to cancel draft on {}: {err}", channel.name());
+                        }
                     }
                 }
             } else if is_context_window_overflow_error(&e) {
@@ -1955,9 +2044,10 @@ async fn process_channel_message(
                     }),
                 );
                 if let Some(channel) = target_channel.as_ref() {
-                    if let Some(ref draft_id) = draft_message_id {
+                    if let Some(ref draft_id_arc) = draft_message_id {
+                        let draft_id = draft_id_arc.lock().await.clone();
                         let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, error_text)
+                            .finalize_draft(&msg.reply_target, &draft_id, error_text)
                             .await;
                     } else {
                         let _ = channel
@@ -2003,9 +2093,10 @@ async fn process_channel_message(
                     );
                 }
                 if let Some(channel) = target_channel.as_ref() {
-                    if let Some(ref draft_id) = draft_message_id {
+                    if let Some(ref draft_id_arc) = draft_message_id {
+                        let draft_id = draft_id_arc.lock().await.clone();
                         let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, &format!("⚠️ Error: {e}"))
+                            .finalize_draft(&msg.reply_target, &draft_id, &format!("⚠️ Error: {e}"))
                             .await;
                     } else {
                         let _ = channel
@@ -2051,9 +2142,10 @@ async fn process_channel_message(
             if let Some(channel) = target_channel.as_ref() {
                 let error_text =
                     "⚠️ Request timed out while waiting for the model. Please try again.";
-                if let Some(ref draft_id) = draft_message_id {
+                if let Some(ref draft_id_arc) = draft_message_id {
+                    let draft_id = draft_id_arc.lock().await.clone();
                     let _ = channel
-                        .finalize_draft(&msg.reply_target, draft_id, error_text)
+                        .finalize_draft(&msg.reply_target, &draft_id, error_text)
                         .await;
                 } else {
                     let _ = channel
@@ -2066,6 +2158,8 @@ async fn process_channel_message(
             }
         }
     }
+
+    crate::health::set_component_activity(&health_component, None);
 
     // Swap 👀 → ✅ (or ⚠️ on error) to signal processing is complete
     if let Some(channel) = target_channel.as_ref() {
@@ -2133,7 +2227,12 @@ async fn run_message_dispatch_loop(
                 }
             }
 
-            process_channel_message(worker_ctx, msg, cancellation_token).await;
+            crate::providers::reliable::run_in_channel_scope(process_channel_message(
+                worker_ctx,
+                msg,
+                cancellation_token,
+            ))
+            .await;
 
             if interrupt_enabled {
                 let mut active = in_flight.lock().await;
@@ -2817,18 +2916,6 @@ fn collect_configured_channels(
         });
     }
 
-    if let Some(ref wati_cfg) = config.channels_config.wati {
-        channels.push(ConfiguredChannel {
-            display_name: "WATI",
-            channel: Arc::new(WatiChannel::new(
-                wati_cfg.api_token.clone(),
-                wati_cfg.api_url.clone(),
-                wati_cfg.tenant_id.clone(),
-                wati_cfg.allowed_numbers.clone(),
-            )),
-        });
-    }
-
     if let Some(ref nc) = config.channels_config.nextcloud_talk {
         channels.push(ConfiguredChannel {
             display_name: "Nextcloud Talk",
@@ -3303,6 +3390,22 @@ pub async fn start_channels(config: Config) -> Result<()> {
             None
         },
         non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
+        audit_logger: if config.security.audit.enabled {
+            let zeroclaw_dir = config
+                .config_path
+                .parent()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| config.workspace_dir.clone());
+            match crate::security::AuditLogger::new(config.security.audit.clone(), zeroclaw_dir) {
+                Ok(logger) => Some(Arc::new(logger)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to create audit logger for channels; tool call audit disabled");
+                    None
+                }
+            }
+        } else {
+            None
+        },
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -3516,6 +3619,7 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            audit_logger: None,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -3565,6 +3669,7 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            audit_logger: None,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -3617,6 +3722,7 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            audit_logger: None,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -4047,6 +4153,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     success: false,
                     output: String::new(),
                     error: Some("unexpected symbol".to_string()),
+                    error_kind: None,
                 });
             }
 
@@ -4054,6 +4161,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 success: true,
                 output: r#"{"symbol":"BTC","price_usd":65000}"#.to_string(),
                 error: None,
+                error_kind: None,
             })
         }
     }
@@ -4092,6 +4200,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -4151,6 +4260,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -4224,6 +4334,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -4283,6 +4394,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -4351,6 +4463,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -4440,6 +4553,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -4511,6 +4625,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -4597,6 +4712,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -4668,6 +4784,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -4728,6 +4845,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -4899,6 +5017,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            audit_logger: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -4979,6 +5098,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            audit_logger: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5071,6 +5191,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            audit_logger: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5145,6 +5266,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -5204,6 +5326,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -5720,6 +5843,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -5805,6 +5929,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -5890,6 +6015,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            audit_logger: None,
         });
 
         process_channel_message(
@@ -6439,6 +6565,7 @@ This is an example JSON object for profile settings."#;
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            audit_logger: None,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -6505,6 +6632,7 @@ This is an example JSON object for profile settings."#;
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            audit_logger: None,
         });
 
         process_channel_message(
