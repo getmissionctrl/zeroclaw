@@ -380,6 +380,7 @@ impl std::fmt::Debug for Config {
             self.channels_config.qq.is_some(),
             self.channels_config.nostr.is_some(),
             self.channels_config.clawdtalk.is_some(),
+            self.channels_config.web.is_some(),
         ]
         .into_iter()
         .filter(|enabled| *enabled)
@@ -3253,6 +3254,8 @@ pub struct ChannelsConfig {
     pub nostr: Option<NostrConfig>,
     /// ClawdTalk voice channel configuration.
     pub clawdtalk: Option<crate::channels::clawdtalk::ClawdTalkConfig>,
+    /// Web UI WebSocket channel configuration.
+    pub web: Option<WebConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -3386,6 +3389,7 @@ impl Default for ChannelsConfig {
             qq: None,
             nostr: None,
             clawdtalk: None,
+            web: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
         }
     }
@@ -3400,6 +3404,42 @@ pub enum StreamMode {
     Off,
     /// Update a draft message with every flush interval.
     Partial,
+}
+
+/// Web UI WebSocket channel configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WebConfig {
+    /// Port to listen on for WebSocket connections.
+    #[serde(default = "default_web_port")]
+    pub port: u16,
+    /// Bind address for the WebSocket server.
+    #[serde(default = "default_web_bind")]
+    pub bind: String,
+    /// Streaming mode (off or partial). Default: partial.
+    #[serde(default = "default_web_stream_mode")]
+    pub stream_mode: StreamMode,
+    /// Draft update flush interval in milliseconds.
+    #[serde(default = "default_web_draft_update_interval_ms")]
+    pub draft_update_interval_ms: u64,
+    /// Optional list of allowed origin hosts for CORS. Empty = allow all.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+}
+
+fn default_web_port() -> u16 {
+    5100
+}
+
+fn default_web_bind() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_web_stream_mode() -> StreamMode {
+    StreamMode::Partial
+}
+
+fn default_web_draft_update_interval_ms() -> u64 {
+    300
 }
 
 fn default_draft_update_interval_ms() -> u64 {
@@ -6878,6 +6918,7 @@ default_temperature = 0.7
                 qq: None,
                 nostr: None,
                 clawdtalk: None,
+                web: None,
                 message_timeout_secs: 300,
             },
             memory: MemoryConfig::default(),
@@ -7770,6 +7811,7 @@ allowed_users = ["@ops:matrix.org"]
             qq: None,
             nostr: None,
             clawdtalk: None,
+            web: None,
             message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
@@ -8048,6 +8090,7 @@ channel_id = "C123"
             qq: None,
             nostr: None,
             clawdtalk: None,
+            web: None,
             message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();

@@ -36,6 +36,7 @@ pub mod telegram;
 pub mod traits;
 pub mod transcription;
 pub mod wati;
+pub mod web;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_storage;
@@ -63,6 +64,7 @@ pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
 pub use wati::WatiChannel;
+pub use web::WebChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
@@ -4453,6 +4455,18 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "ClawdTalk",
             channel: Arc::new(ClawdTalkChannel::new(ct.clone())),
+        });
+    }
+
+    if let Some(ref web_cfg) = config.channels_config.web {
+        channels.push(ConfiguredChannel {
+            display_name: "Web",
+            channel: Arc::new(WebChannel::new(
+                web_cfg.port,
+                web_cfg.bind.clone(),
+                web_cfg.stream_mode,
+                web_cfg.draft_update_interval_ms,
+            )),
         });
     }
 
