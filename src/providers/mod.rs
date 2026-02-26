@@ -852,6 +852,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "fireworks" | "fireworks-ai" => vec!["FIREWORKS_API_KEY"],
         "perplexity" => vec!["PERPLEXITY_API_KEY"],
         "cohere" => vec!["COHERE_API_KEY"],
+        "sambanova" => vec!["SAMBANOVA_API_KEY"],
         name if is_moonshot_alias(name) => vec!["MOONSHOT_API_KEY"],
         "kimi-code" | "kimi_coding" | "kimi_for_coding" => {
             vec!["KIMI_CODE_API_KEY", "MOONSHOT_API_KEY"]
@@ -1197,6 +1198,9 @@ fn create_provider_with_url_and_options(
         ))),
         "cohere" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Cohere", "https://api.cohere.com/compatibility", key, AuthStyle::Bearer,
+        ))),
+        "sambanova" | "samba-nova" => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "SambaNova", "https://api.sambanova.ai/v1", key, AuthStyle::Bearer,
         ))),
         "copilot" | "github-copilot" => Ok(Box::new(copilot::CopilotProvider::new(key))),
         "lmstudio" | "lm-studio" => {
@@ -1757,6 +1761,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             name: "cohere",
             display_name: "Cohere",
             aliases: &[],
+            local: false,
+        },
+        ProviderInfo {
+            name: "sambanova",
+            display_name: "SambaNova",
+            aliases: &["samba-nova"],
             local: false,
         },
         ProviderInfo {
@@ -2768,6 +2778,7 @@ mod tests {
             "fireworks",
             "perplexity",
             "cohere",
+            "sambanova",
             "copilot",
             "nvidia",
             "astrai",
